@@ -1,52 +1,70 @@
 import os
-import gc  # Garbage Collector interface
-from flask import Flask, jsonify, request, send_from_directory, abort
+import gc
+import mimetypes
+from flask import Flask, jsonify, request, send_from_directory, abort, Response
 from flask_cors import CORS
 import fastf1
 import pandas as pd
 import numpy as np
 
-# 1. APP CONFIG: Serve files from current directory (.) to support browser-side Babel
+# ==========================================
+# 1. APP & MIME TYPES CONFIGURATION
+# ==========================================
+
+# Explicitly tell the browser that .ts and .tsx files are JavaScript
+# This fixes the "Blocked because MIME type mismatch" errors
+mimetypes.add_type('application/javascript', '.ts')
+mimetypes.add_type('application/javascript', '.tsx')
+
+# We set static_folder to '.' so Flask can find files in the root directory
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
-# 2. CACHE: Use /tmp for Render
+# ==========================================
+# 2. RENDER-SPECIFIC CACHING
+# ==========================================
+
+# Render only allows writing to /tmp
 cache_dir = '/tmp/f1_cache'
 if not os.path.exists(cache_dir):
     os.makedirs(cache_dir)
 fastf1.Cache.enable_cache(cache_dir)
 
 # ==========================================
-#  SMART STATIC SERVING (The Fix for 404s)
+# 3. SMART STATIC SERVING (The Fix)
 # ==========================================
 
 @app.route('/')
 def serve_index():
-    # Explicitly serve index.html at root
+    # Serve index.html at the root URL
     return send_from_directory('.', 'index.html')
 
 @app.route('/<path:path>')
 def serve_static(path):
-    # Security: Prevent accessing hidden files or server code
-    if path.startswith('.') or path == 'server.py' or path == 'Procfile':
+    # Security: Prevent access to backend code
+    if path in ['server.py', 'Procfile', 'requirements.txt'] or path.startswith('.git'):
         abort(403)
 
-    # 1. Try to serve the exact file requested
+    # A. If the file exists exactly as requested, serve it
     if os.path.exists(path):
         return send_from_directory('.', path)
-    
-    # 2. SMART FIX: If not found, try adding .tsx or .ts
-    # This solves "import App from './App'" 404 errors
+
+    # B. SMART FIX: Handle extension-less imports (e.g., import App from './App')
+    # If browser asks for "App", we look for "App.tsx" or "App.ts"
     if os.path.exists(path + '.tsx'):
         return send_from_directory('.', path + '.tsx')
     if os.path.exists(path + '.ts'):
         return send_from_directory('.', path + '.ts')
     
-    # 3. Fallback to index.html for React Router paths
-    return send_from_directory('.', 'index.html')
+    # C. Fallback to index.html for React Router (e.g. /dashboard -> index.html)
+    # Only if it looks like a page navigation, not a missing asset
+    if '.' not in path:
+         return send_from_directory('.', 'index.html')
+         
+    return abort(404)
 
 # ==========================================
-#  API ROUTES (Memory Optimized)
+# 4. API ROUTES (Memory Optimized)
 # ==========================================
 
 @app.route('/api/race-data')
@@ -54,79 +72,83 @@ def get_race_data():
     year = request.args.get('year', default=2023, type=int)
     track = request.args.get('track', default='Monza', type=str)
     
-    print(f"🏁 LOADING: {year} {track} GP (Low Mem Mode)")
+    print(f"🏁 LOADING: {year} {track} GP (Render Mode)")
     
     try:
-        # MEMORY FIX 1: Load ONLY what we need
-        # We disable weather data to save RAM
+        # MEMORY OPTIMIZATION #1: Load only critical data
+        # disabling weather/messages saves ~50-100MB RAM
         session = fastf1.get_session(year, track, 'R')
         session.load(telemetry=True, laps=True, weather=False, messages=False)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Garbage collect immediately after load
+    # Force garbage collection to free memory immediately
     gc.collect()
 
+    # --- A. Generate Sparse Track Map ---
+    track_path = []
     try:
-        # MEMORY FIX 2: Downsample Track Map
         fastest_lap = session.laps.pick_fastest()
         telemetry = fastest_lap.get_telemetry()
-        # Take only 1 out of every 5 points for the map
-        track_path = [{"x": int(row['X']), "y": int(row['Y'])} for _, row in telemetry.iloc[::5].iterrows()]
+        # MEMORY OPTIMIZATION #2: Downsample Map (1 point every 10)
+        track_path = [{"x": int(row['X']), "y": int(row['Y'])} for _, row in telemetry.iloc[::10].iterrows()]
     except:
-        track_path = []
+        pass
 
+    # --- B. Process Drivers ---
     driver_numbers = [d for d in session.drivers if not session.laps.pick_drivers(d).empty]
-    driver_data = {}
-    driver_info_map = {}
     
     min_time = pd.Timedelta.max
     max_time = pd.Timedelta.min
-    
-    # Scan Boundaries
+    raw_streams = {}
+    driver_info_map = {}
+
     for drv_num in driver_numbers:
         try:
+            d_info = session.get_driver(drv_num)
+            drv_id = d_info['Abbreviation']
+            driver_info_map[drv_id] = d_info
+            
             laps = session.laps.pick_drivers(drv_num)
-            # MEMORY FIX 3: Get ONLY necessary columns immediately
-            # This drops unused data like 'Brake', 'Source', 'RelativeDistance' early
+            
+            # MEMORY OPTIMIZATION #3: Filter Columns Immediately
+            # We discard unused columns before they even hit variable storage
             car = laps.get_car_data()[['Time', 'Speed', 'RPM', 'nGear', 'Throttle', 'Brake', 'DRS']]
             pos = laps.get_pos_data()[['Time', 'X', 'Y']]
             
             if car.empty or pos.empty: continue
             
-            # Update boundaries
+            # Find timeline boundaries
             t_min = car['Time'].min()
             t_max = car['Time'].max()
             if t_min < min_time: min_time = t_min
             if t_max > max_time: max_time = t_max
             
-            d_info = session.get_driver(drv_num)
-            driver_info_map[d_info['Abbreviation']] = d_info
+            raw_streams[drv_id] = { "car": car, "pos": pos, "laps": laps[['LapStartTime', 'LapNumber', 'Compound', 'TyreLife']] }
             
-            # MEMORY FIX 4: Store only minimal raw data
-            driver_data[d_info['Abbreviation']] = { 
-                "car": car, "pos": pos, "laps": laps[['LapStartTime', 'LapNumber', 'Compound', 'TyreLife']] 
-            }
         except:
             continue
-            
+    
     if min_time == pd.Timedelta.max:
         return jsonify({"error": "No data found"}), 404
+        
+    # MEMORY OPTIMIZATION #4: Aggressive Timeline Downsampling
+    # 1s frequency (1Hz) is enough for a smooth-ish web view and prevents OOM crashes
+    timeline = pd.timedelta_range(start=min_time, end=max_time, freq='1s')
+    
+    frames = []
+    timeline_seconds = timeline.total_seconds()
+    
+    # Process drivers one by one to keep peak memory usage low
+    processed_drivers = {}
 
-    # MEMORY FIX 5: Low Frequency Timeline
-    # 500ms freq (2fps) is much lighter than 250ms
-    timeline = pd.timedelta_range(start=min_time, end=max_time, freq='500ms')
-    
-    processed_data = {}
-    
-    # Align Drivers (Iterative to save RAM)
-    for drv_id, stream in driver_data.items():
+    for drv_id, stream in raw_streams.items():
         try:
-            # Drop duplicates and sort
+            # Clean & Sort
             raw_car = stream["car"].drop_duplicates(subset=['Time']).set_index('Time').sort_index()
             raw_pos = stream["pos"].drop_duplicates(subset=['Time']).set_index('Time').sort_index()
             
-            # Reindex
+            # Align
             aligned_car = raw_car.reindex(timeline, method='nearest')
             aligned_pos = raw_pos.reindex(timeline, method='nearest')
             
@@ -142,14 +164,14 @@ def get_race_data():
                 'Y': aligned_pos['Y']
             })
             
-            # Clean up raw dataframes immediately to free RAM
+            # Cleanup raw immediately
             del raw_car
             del raw_pos
             del aligned_car
             del aligned_pos
             
-            # Add Computed Fields
-            combined['TotalDistance'] = (combined['Speed'] / 3.6 * 0.5).cumsum().fillna(0) # 0.5s intervals
+            # Calculations
+            combined['TotalDistance'] = (combined['Speed'] / 3.6).cumsum().fillna(0) # 1s intervals
             combined['LapNumber'] = 1
             combined['TyreCompound'] = 'SOFT'
             combined['TyreLife'] = 1
@@ -163,26 +185,24 @@ def get_race_data():
                 combined.loc[mask, 'LapNumber'] = lap['LapNumber']
                 combined.loc[mask, 'TyreCompound'] = lap['Compound']
                 combined.loc[mask, 'TyreLife'] = lap['TyreLife']
-            
-            processed_data[drv_id] = combined
+                
+            processed_drivers[drv_id] = combined
             
         except:
             continue
-            
-    # Clear raw driver data dict
-    driver_data = None
+
+    # Cleanup raw streams dict to free massive RAM block
+    raw_streams = None
     gc.collect()
 
-    # Package Frames
-    frames = []
-    timeline_seconds = timeline.total_seconds()
-    
+    # --- C. Package JSON Frames ---
+    # Loop through the timeline index
     for i in range(len(timeline)):
         ts = int(timeline_seconds[i] * 1000)
         frame_drivers = []
         leader_lap = 0
         
-        for drv_id, df in processed_data.items():
+        for drv_id, df in processed_drivers.items():
             try:
                 row = df.iloc[i]
                 if pd.isna(row['X']): continue
@@ -224,6 +244,7 @@ def get_race_data():
     return jsonify({ "trackPath": track_path, "frames": frames })
 
 if __name__ == '__main__':
+    # Use the PORT provided by Render
     port = int(os.environ.get('PORT', 5000))
     print(f"🚀 RENDER SERVER READY ON PORT {port}")
     app.run(host='0.0.0.0', port=port)
