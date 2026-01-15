@@ -1,11 +1,35 @@
-<div align="center">
+# F1 Engineer Dashboard
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+A broadcast-quality telemetry dashboard for F1 data visualization.
 
-  <h1>Built with AI Studio</h2>
+## 🚀 How to Execute (Run the App)
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+This is a full-stack application. You need to run two separate processes:
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+### 1. The Backend (Python)
+This fetches **Real F1 Data** (Track shapes, Driver lists) from the internet using the `FastF1` library.
 
-</div>
+1.  Open a terminal in this folder.
+2.  Install the required libraries:
+    ```bash
+    pip install -r requirements.txt
+    ```
+    *(Note: installing pandas/fastf1 might take a minute)*
+3.  Start the server:
+    ```bash
+    python server.py
+    ```
+    **Keep this window open.** It acts as the brain of the operation.
+
+### 2. The Frontend (React)
+This is the visual dashboard.
+
+1.  Open this folder in VS Code.
+2.  **Right-click `index.html`** and select **"Open with Live Server"**.
+3.  The browser will open.
+4.  Select a Year and Track (e.g., 2023 Bahrain) and click **Initialize Session**.
+    *   *The first time you load a track, it might take 10-20 seconds for the Python server to download the cache.*
+
+## ⚠️ Troubleshooting
+*   **"Connection Failed":** Ensure `server.py` is running and says "Listening on http://localhost:5000".
+*   **Slow Load:** Real F1 data is large. The first load downloads data to a `f1_cache` folder. Subsequent loads are instant.
