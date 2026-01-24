@@ -8,29 +8,25 @@ interface RaceDataResponse {
 }
 
 // INTELLIGENT URL SELECTION
-// If we are on localhost (Live Server usually port 5500), point to Python on 5000.
-// If we are on the real web (Production), use the relative path.
-const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-const BACKEND_URL = isLocal ? 'http://localhost:5000/api/race-data' : '/api/race-data';
+// Since server.py serves the frontend, we can just use relative paths.
+const BACKEND_URL = '/api/race-data';
 
-// Helper for delay
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- REAL DATA LOADER ---
 export const fetchRaceData = async (year: number, trackId: string): Promise<{ frames: RaceFrame[], trackPath: Coordinates[] }> => {
-  const maxRetries = 3;
+  const maxRetries = 1; // Faster fail locally
   let attempt = 0;
 
   while (attempt < maxRetries) {
     try {
-        // Use the dynamic URL
         const url = `${BACKEND_URL}?year=${year}&track=${trackId}`;
-        console.log(`📡 Connecting to Telemetry Server (Attempt ${attempt + 1}/${maxRetries}): ${url}`);
+        console.log(`📡 Fetching Telemetry: ${url}`);
         
         const response = await fetch(url);
         
         if (!response.ok) {
-            throw new Error(`Server Error: ${response.statusText}`);
+            const errorText = await response.text();
+            throw new Error(`Server Error (${response.status}): ${errorText}`);
         }
         
         const data: RaceDataResponse = await response.json();
@@ -41,19 +37,16 @@ export const fetchRaceData = async (year: number, trackId: string): Promise<{ fr
 
         console.log("✅ Data Received:", data.frames.length, "frames");
 
-        // Transform raw JSON to strictly typed objects
         const frames: RaceFrame[] = data.frames.map((f: any) => ({
             timestamp: f.timestamp,
             drivers: f.drivers.map((d: any) => ({
                 ...d,
-                // Robust defaults
                 tyreCompound: d.tyreCompound || 'SOFT', 
                 tyreAge: d.tyreAge || 0,
                 lap: d.lap || 0,
                 totalDistance: d.totalDistance || 0,
                 currentSector: d.currentSector || 1,
                 isPitting: d.isPitting || false,
-                // Ensure inputs are 0-100
                 throttle: Math.min(100, Math.max(0, d.throttle)),
                 brake: Math.min(100, Math.max(0, d.brake))
             })),
@@ -70,20 +63,12 @@ export const fetchRaceData = async (year: number, trackId: string): Promise<{ fr
     } catch (error) {
         console.warn(`⚠️ Attempt ${attempt + 1} Failed:`, error);
         attempt++;
-        if (attempt < maxRetries) {
-            await delay(1000); // Wait 1s before retry
-        } else {
-            // Return empty so the UI can handle the error state
-            return { frames: [], trackPath: [] };
-        }
     }
   }
   return { frames: [], trackPath: [] };
 };
 
-// --- FALLBACK SIMULATION GENERATOR ---
 export const generateDemoData = (): { frames: RaceFrame[], trackPath: Coordinates[] } => {
-    // 1. Create a "Figure 8" Track (Suzuka-style)
     const trackPath: Coordinates[] = [];
     const POINTS = 800;
     for (let i = 0; i <= POINTS; i++) {
@@ -93,9 +78,8 @@ export const generateDemoData = (): { frames: RaceFrame[], trackPath: Coordinate
         trackPath.push({ x: x + 1500, y: y + 1000 });
     }
 
-    // 2. Generate Frames
     const frames: RaceFrame[] = [];
-    const TOTAL_FRAMES = 1000;
+    const TOTAL_FRAMES = 500;
     
     for (let f = 0; f < TOTAL_FRAMES; f++) {
         const frameDrivers: DriverState[] = ALL_DRIVERS.map((d, idx) => {
@@ -136,7 +120,6 @@ export const generateDemoData = (): { frames: RaceFrame[], trackPath: Coordinate
             };
         });
 
-        // Sort by distance to simulate race positions
         frameDrivers.sort((a, b) => b.totalDistance - a.totalDistance);
 
         frames.push({
